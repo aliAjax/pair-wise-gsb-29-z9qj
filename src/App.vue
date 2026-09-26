@@ -1,190 +1,164 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import {
+  computePenalty,
+  describeRule,
+  DECISION_STATUS_LABELS,
+  ORDER_KIND_LABELS,
+  RESPONSIBILITY_LABELS,
+  SETTLEMENT_STATE_LABELS,
+  type OrderKind,
+  type Responsibility,
+  type SettlementState,
+} from "./domain/settlement";
+import { useSettlementStore, type OrderSummary } from "./stores/settlement";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = useSettlementStore();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const responsibilities = Object.keys(RESPONSIBILITY_LABELS) as Responsibility[];
+const stateFilters: Array<"all" | SettlementState> = ["all", "unsettled", "pending", "deducted", "frozen", "exempt"];
 
-const project = {
-  "number": 15,
-  "folder": "hxwl/frontend/hxwlfront-15",
-  "framework": "vue",
-  "title": "城市末端配送模拟",
-  "subtitle": "维护骑手和订单点位，分配附近订单到配送清单。",
-  "industry": "物流",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Element Plus",
-    "Leaflet"
-  ],
-  "storageKey": "hxwlfront-15-last-mile",
-  "formTitle": "新增订单点",
-  "primaryAction": "加入地图",
-  "entityLabel": "订单点",
-  "statuses": [
-    "未分配",
-    "已分配",
-    "已送达"
-  ],
-  "filters": [
-    "全部骑手",
-    "骑手A",
-    "骑手B",
-    "骑手C"
-  ],
-  "fields": [
-    {
-      "key": "rider",
-      "label": "骑手",
-      "type": "select",
-      "options": [
-        "骑手A",
-        "骑手B",
-        "骑手C"
-      ]
-    },
-    {
-      "key": "address",
-      "label": "地址"
-    },
-    {
-      "key": "distance",
-      "label": "距离km",
-      "type": "number"
-    },
-    {
-      "key": "slot",
-      "label": "配送时段"
-    }
-  ],
-  "records": [
-    {
-      "rider": "骑手A",
-      "address": "世纪大道",
-      "distance": 1.8,
-      "slot": "10:00-12:00",
-      "status": "已分配",
-      "notes": "优先配送"
-    },
-    {
-      "rider": "骑手B",
-      "address": "陆家嘴",
-      "distance": 2.4,
-      "slot": "14:00-16:00",
-      "status": "未分配",
-      "notes": "待确认"
-    }
-  ],
-  "metricLabels": [
-    "订单点",
-    "已分配",
-    "平均距离"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+function toLocalInput(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
+const now = new Date();
+const form = reactive({
+  code: `D${Date.now().toString().slice(-8)}`,
+  kind: "normal" as OrderKind,
+  amount: 50,
+  promisedAt: toLocalInput(now),
+  actualAt: toLocalInput(new Date(now.getTime() + 20 * 60000)),
+  delayReason: "",
+});
+
+const search = ref("");
+const stateFilter = ref<"all" | SettlementState>("all");
+
+/** 每张卡片的交互状态（申诉/改判/历史展开与草稿输入） */
+type CardUi = {
+  responsibility: Responsibility;
+  note: string;
+  appealNote: string;
+  overturnResponsibility: Responsibility;
+  overturnNote: string;
+  showAppeal: boolean;
+  showOverturn: boolean;
+  showHistory: boolean;
+};
+const ui = reactive<Record<string, CardUi>>({});
+
+function cardUi(orderId: string): CardUi {
+  if (!ui[orderId]) {
+    ui[orderId] = {
+      responsibility: "rider",
+      note: "",
+      appealNote: "",
+      overturnResponsibility: "merchant",
+      overturnNote: "",
+      showAppeal: false,
+      showOverturn: false,
+      showHistory: false,
+    };
   }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
+  return ui[orderId];
 }
 
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
+const filtered = computed(() =>
+  store.summaries.filter((item) => {
+    const keyword = search.value.trim();
+    const matchKeyword = !keyword || item.order.code.includes(keyword);
+    const matchState = stateFilter.value === "all" || item.state === stateFilter.value;
+    return matchKeyword && matchState;
+  })
+);
 
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+const filteredAudit = computed(() => {
+  const keyword = search.value.trim();
+  if (!keyword) return store.audit;
+  return store.audit.filter((entry) => entry.orderCode.includes(keyword));
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
-
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
+const chartRows = computed(() =>
+  (Object.keys(SETTLEMENT_STATE_LABELS) as SettlementState[]).map((state) => ({
+    state,
+    label: SETTLEMENT_STATE_LABELS[state],
+    value: store.summaries.filter((item) => item.state === state).length,
+  }))
+);
 const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
 
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
+function fmtTime(iso: string): string {
+  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
+function fmtMoney(value: number): string {
+  return `¥${value.toFixed(2)}`;
 }
 
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+/** 表单试算：日期未填或非法时按 0 分钟处理，避免渲染报错 */
+const formLate = computed(() => {
+  const promised = new Date(form.promisedAt).getTime();
+  const actual = new Date(form.actualAt).getTime();
+  if (Number.isNaN(promised) || Number.isNaN(actual)) return 0;
+  return Math.max(0, Math.floor((actual - promised) / 60000));
+});
+
+const formPenalty = computed(() => computePenalty(form.kind, Number(form.amount) || 0, formLate.value).amount);
+
+function breakdownText(item: OrderSummary): string {
+  const detail = computePenalty(item.order.kind, item.order.amount, item.late);
+  if (detail.steps === 0) return `迟到 ${detail.lateMinutes} 分钟，未触发扣款`;
+  const capped = detail.capped ? `，封顶 ${detail.cap} 元` : "";
+  return `迟到 ${detail.lateMinutes} 分钟，计 ${detail.steps} 步 × ${(detail.ratePerStep * 100).toFixed(0)}%${capped}`;
 }
 
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
+function submitOrder() {
+  store.addOrder({
+    code: form.code.trim(),
+    kind: form.kind,
+    amount: Number(form.amount),
+    promisedAt: new Date(form.promisedAt).toISOString(),
+    actualAt: new Date(form.actualAt).toISOString(),
+    delayReason: form.delayReason.trim() || "未填写",
+  });
+  form.code = `D${Date.now().toString().slice(-8)}`;
+  form.delayReason = "";
 }
 
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
+function saveDraft(item: OrderSummary) {
+  const card = cardUi(item.order.id);
+  store.draftDecision(item.order.id, card.responsibility, card.note.trim());
+  card.note = "";
 }
 
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+function confirm(item: OrderSummary) {
+  if (item.latest) store.confirmDecision(item.latest.id);
+}
+
+function appeal(item: OrderSummary) {
+  const card = cardUi(item.order.id);
+  if (item.latest) store.appealDecision(item.latest.id, card.appealNote.trim());
+  card.appealNote = "";
+  card.showAppeal = false;
+}
+
+function uphold(item: OrderSummary) {
+  if (item.latest) store.upholdAppeal(item.latest.id, "");
+}
+
+function overturn(item: OrderSummary) {
+  const card = cardUi(item.order.id);
+  if (item.latest) store.overturnDecision(item.latest.id, card.overturnResponsibility, card.overturnNote.trim());
+  card.overturnNote = "";
+  card.showOverturn = false;
+}
+
+function removeOrder(item: OrderSummary) {
+  if (window.confirm(`确认删除订单 ${item.order.code}？其判定记录将一并移除。`)) {
+    store.removeOrder(item.order.id);
+  }
 }
 </script>
 
@@ -193,77 +167,198 @@ function remove(id: string) {
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">物流行业 · 月底结算对账</p>
+          <h1>时效结算台</h1>
+          <p class="subtitle">
+            每单记录订单金额、承诺与实际送达、延迟原因；按规则试算扣款，确认后的责任单才扣款，申诉未结先冻结，改判留痕可查。
+          </p>
         </div>
         <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+          <span class="tag">普通单：{{ describeRule("normal") }}</span>
+          <span class="tag">冷链单：{{ describeRule("coldchain") }}</span>
         </div>
       </header>
 
       <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
+        <article class="metric">
+          <span>订单数</span>
+          <strong>{{ store.totals.count }}</strong>
+        </article>
+        <article class="metric">
+          <span>已确认扣款</span>
+          <strong>{{ fmtMoney(store.totals.deducted) }}</strong>
+        </article>
+        <article class="metric">
+          <span>申诉冻结金额</span>
+          <strong>{{ fmtMoney(store.totals.frozen) }}</strong>
+        </article>
+        <article class="metric">
+          <span>申诉中订单</span>
+          <strong>{{ store.totals.appealing }}</strong>
         </article>
       </section>
 
       <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
+        <form class="panel" @submit.prevent="submitOrder">
+          <h2>录入订单</h2>
           <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
+            <label>
+              订单号
+              <input v-model="form.code" required placeholder="如 D20260926-006" />
             </label>
             <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
+              订单类型
+              <select v-model="form.kind">
+                <option v-for="(label, kind) in ORDER_KIND_LABELS" :key="kind" :value="kind">{{ label }}</option>
+              </select>
             </label>
-            <button type="submit">{{ project.primaryAction }}</button>
+            <label>
+              订单金额（元）
+              <input v-model="form.amount" type="number" min="0.01" step="0.01" required />
+            </label>
+            <label>
+              承诺送达
+              <input v-model="form.promisedAt" type="datetime-local" required />
+            </label>
+            <label>
+              实际送达
+              <input v-model="form.actualAt" type="datetime-local" required />
+            </label>
+            <label>
+              延迟原因
+              <textarea v-model="form.delayReason" placeholder="现场记录的延迟原因，如出餐慢、门禁等待" />
+            </label>
+            <p class="hint">
+              试算：迟到 {{ formLate }} 分钟，若责任成立扣 {{ fmtMoney(formPenalty) }}
+            </p>
+            <button type="submit">加入结算台</button>
           </div>
         </form>
 
         <section class="list-panel">
           <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
+            <h2>结算单列表</h2>
+            <input v-model="search" class="search" placeholder="按订单号核对，如 D20260926-005" />
+            <select v-model="stateFilter">
+              <option value="all">全部状态</option>
+              <option v-for="state in stateFilters.slice(1)" :key="state" :value="state">
+                {{ SETTLEMENT_STATE_LABELS[state] }}
+              </option>
             </select>
           </div>
 
           <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
+            <div v-if="filtered.length === 0" class="empty">暂无匹配订单</div>
+            <article v-for="item in filtered" :key="item.order.id" class="record">
               <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
+                <p class="record-title">
+                  {{ item.order.code }}
+                  <span class="kind" :class="item.order.kind">{{ ORDER_KIND_LABELS[item.order.kind] }}</span>
+                </p>
+                <span class="status" :class="`state-${item.state}`">{{ SETTLEMENT_STATE_LABELS[item.state] }}</span>
               </div>
+
               <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
+                <span>订单金额：{{ fmtMoney(item.order.amount) }}</span>
+                <span>承诺送达：{{ fmtTime(item.order.promisedAt) }}</span>
+                <span>实际送达：{{ fmtTime(item.order.actualAt) }}</span>
+                <span>迟到：{{ item.late }} 分钟</span>
               </div>
-              <p class="note">{{ record.notes }}</p>
+              <p class="note">延迟原因：{{ item.order.delayReason }}</p>
+              <p class="rule-line">规则试算：{{ breakdownText(item) }}，责任成立扣 {{ fmtMoney(item.preview) }}</p>
+
+              <div v-if="item.latest" class="decision" :class="`decision-${item.latest.status}`">
+                <strong>当前判定 v{{ item.latest.version }}</strong>
+                <span>{{ RESPONSIBILITY_LABELS[item.latest.responsibility] }} · {{ DECISION_STATUS_LABELS[item.latest.status] }}</span>
+                <span>扣款 {{ fmtMoney(item.latest.penalty) }}（判定时迟到 {{ item.latest.lateMinutes }} 分钟）</span>
+                <span v-if="item.latest.note">说明：{{ item.latest.note }}</span>
+              </div>
+
+              <!-- 未判定 / 草稿：录入或修改判定 -->
+              <div v-if="item.state === 'unsettled' || item.state === 'pending'" class="action-block">
+                <div class="inline-form">
+                  <select v-model="cardUi(item.order.id).responsibility">
+                    <option v-for="party in responsibilities" :key="party" :value="party">
+                      {{ RESPONSIBILITY_LABELS[party] }}
+                    </option>
+                  </select>
+                  <input v-model="cardUi(item.order.id).note" placeholder="判定说明，如轨迹、小票佐证" />
+                  <button type="button" @click="saveDraft(item)">
+                    {{ item.state === "pending" ? "保存草稿" : "生成判定" }}
+                  </button>
+                  <button v-if="item.state === 'pending'" type="button" @click="confirm(item)">确认生效</button>
+                </div>
+              </div>
+
+              <!-- 已确认：可发起申诉 -->
+              <div v-if="item.state === 'deducted' || item.state === 'exempt'" class="action-block">
+                <div v-if="!cardUi(item.order.id).showAppeal" class="actions">
+                  <button v-if="item.state === 'deducted'" type="button" class="secondary" @click="cardUi(item.order.id).showAppeal = true">发起申诉</button>
+                </div>
+                <div v-else class="inline-form">
+                  <input v-model="cardUi(item.order.id).appealNote" placeholder="申诉理由，冻结期间不扣款" />
+                  <button type="button" @click="appeal(item)">提交申诉并冻结</button>
+                  <button type="button" class="secondary" @click="cardUi(item.order.id).showAppeal = false">取消</button>
+                </div>
+              </div>
+
+              <!-- 申诉中：维持或改判 -->
+              <div v-if="item.state === 'frozen'" class="action-block">
+                <div class="actions">
+                  <button type="button" @click="uphold(item)">维持原判</button>
+                  <button type="button" class="secondary" @click="cardUi(item.order.id).showOverturn = !cardUi(item.order.id).showOverturn">
+                    改判
+                  </button>
+                </div>
+                <div v-if="cardUi(item.order.id).showOverturn" class="inline-form">
+                  <select v-model="cardUi(item.order.id).overturnResponsibility">
+                    <option v-for="party in responsibilities" :key="party" :value="party">
+                      {{ RESPONSIBILITY_LABELS[party] }}
+                    </option>
+                  </select>
+                  <input v-model="cardUi(item.order.id).overturnNote" placeholder="改判依据，将生成新版本" />
+                  <button type="button" @click="overturn(item)">确认改判</button>
+                </div>
+              </div>
+
               <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
+                <button type="button" class="secondary" @click="cardUi(item.order.id).showHistory = !cardUi(item.order.id).showHistory">
+                  {{ cardUi(item.order.id).showHistory ? "收起版本" : `判定版本（${item.versions.length}）` }}
+                </button>
+                <button type="button" class="danger" @click="removeOrder(item)">删除</button>
+              </div>
+
+              <div v-if="cardUi(item.order.id).showHistory && item.versions.length" class="history">
+                <div v-for="version in item.versions" :key="version.id" class="history-row">
+                  <span class="version">v{{ version.version }}</span>
+                  <span>{{ RESPONSIBILITY_LABELS[version.responsibility] }}</span>
+                  <span>{{ fmtMoney(version.penalty) }}</span>
+                  <span class="status small" :class="`decision-${version.status}`">{{ DECISION_STATUS_LABELS[version.status] }}</span>
+                  <span class="history-note">{{ version.note || "—" }} · {{ fmtTime(version.createdAt) }}</span>
+                </div>
               </div>
             </article>
           </div>
 
           <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
+            <div v-for="row in chartRows" :key="row.state" class="bar">
+              <span>{{ row.label }}</span>
               <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
               <strong>{{ row.value }}</strong>
             </div>
           </div>
         </section>
+      </section>
+
+      <section class="panel audit-panel">
+        <h2>操作留档{{ search.trim() ? `（订单号含「${search.trim()}」）` : "" }}</h2>
+        <div v-if="filteredAudit.length === 0" class="empty">暂无留档记录</div>
+        <div v-for="entry in filteredAudit" :key="entry.id" class="audit-row">
+          <span class="audit-time">{{ fmtTime(entry.at) }}</span>
+          <span class="audit-code">{{ entry.orderCode }}</span>
+          <span class="audit-action">{{ entry.action }}</span>
+          <span class="audit-detail">{{ entry.detail }}</span>
+        </div>
       </section>
     </div>
   </main>
